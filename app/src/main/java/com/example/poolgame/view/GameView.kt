@@ -5,6 +5,7 @@ import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.DashPathEffect
 import android.graphics.Paint
+import android.graphics.RectF
 import android.util.AttributeSet
 import android.view.MotionEvent
 import android.view.SurfaceHolder
@@ -20,10 +21,11 @@ import kotlin.math.min
 /**
  * A fully playable single-view pool prototype:
  *  - Renders table, balls, pockets
- *  - Touch-drag from the cue ball aims (shows live trajectory preview)
+ *  - Touch-drag from the cue ball aims (shows live trajectory preview + power meter)
  *  - Releasing the drag shoots the cue ball; power scales with drag distance
  *  - Runs a real physics simulation (friction, cushions, collisions, pockets)
  *    every frame until all balls stop, then re-enables aiming
+ *  - Top bar lets you reset the rack or cycle the table felt color
  *
  * This is a starting point for a real game, not a finished product — turn
  * order, fouls, ball-type assignment (solids/stripes), and win conditions
@@ -48,12 +50,27 @@ class GameView @JvmOverloads constructor(
     private var dragCurrent = Vec2(0f, 0f)
     private var isSimulating = false
 
+    /** Drag distance (world units) that counts as 100% power. Tune to taste. */
+    private val maxDragForFullPower = 420f
+
     // World <-> screen transform
     private var scale = 1f
     private var offsetX = 0f
     private var offsetY = 0f
 
-    private val feltPaint = Paint().apply { color = Color.rgb(20, 110, 60) }
+    // --- Top HUD bar (New Rack / Table Color buttons) ---
+    private val hudHeight = 120f
+    private val resetButtonRect = RectF(30f, 30f, 260f, 90f)
+    private val colorButtonRect = RectF(290f, 30f, 560f, 90f)
+    private val feltColorOptions = listOf(
+        Color.rgb(20, 110, 60),   // classic green
+        Color.rgb(20, 70, 130),   // tournament blue
+        Color.rgb(110, 20, 30),  // burgundy
+        Color.rgb(30, 30, 30)    // black diamond
+    )
+    private var feltColorIndex = 0
+
+    private val feltPaint = Paint().apply { color = feltColorOptions[feltColorIndex] }
     private val cushionPaint = Paint().apply {
         color = Color.rgb(90, 60, 30); style = Paint.Style.STROKE; strokeWidth = 10f
     }
@@ -72,6 +89,17 @@ class GameView @JvmOverloads constructor(
         color = Color.argb(230, 255, 210, 40); strokeWidth = 5f; style = Paint.Style.STROKE; isAntiAlias = true
     }
     private val ballPaintCache = mutableMapOf<Int, Paint>()
+
+    private val hudButtonPaint = Paint().apply { color = Color.argb(210, 40, 40, 40) }
+    private val hudTextPaint = Paint().apply {
+        color = Color.WHITE; textSize = 30f; isAntiAlias = true; textAlign = Paint.Align.CENTER
+    }
+
+    private val powerMeterBgPaint = Paint().apply { color = Color.argb(140, 0, 0, 0) }
+    private val powerMeterFillPaint = Paint().apply { isAntiAlias = true }
+    private val powerMeterTextPaint = Paint().apply {
+        color = Color.WHITE; textSize = 26f; isAntiAlias = true; textAlign = Paint.Align.CENTER
+    }
 
     init {
         holder.addCallback(this)
@@ -100,6 +128,27 @@ class GameView @JvmOverloads constructor(
         }.toMutableList()
     }
 
+    /** Resets the cue ball and all object balls back to the starting rack layout. */
+    private fun resetRack() {
+        cueBall.position = Vec2(500f, 500f)
+        cueBall.velocity = Vec2(0f, 0f)
+        cueBall.pocketed = false
+
+        val fresh = buildRack()
+        for (i in objectBalls.indices) {
+            objectBalls[i].position = fresh[i].position
+            objectBalls[i].velocity = Vec2(0f, 0f)
+            objectBalls[i].pocketed = false
+        }
+        isSimulating = false
+        isAiming = false
+    }
+
+    private fun cycleFeltColor() {
+        feltColorIndex = (feltColorIndex + 1) % feltColorOptions.size
+        feltPaint.color = feltColorOptions[feltColorIndex]
+    }
+
     // --- Surface lifecycle ---
 
     override fun surfaceCreated(holder: SurfaceHolder) {
@@ -121,20 +170,31 @@ class GameView @JvmOverloads constructor(
     private fun computeTransform() {
         val pad = 40f
         val availW = width - 2 * pad
-        val availH = height - 2 * pad
+        val availH = height - 2 * pad - hudHeight
         if (availW <= 0f || availH <= 0f) return
         scale = min(availW / table.playWidth, availH / table.playHeight)
         offsetX = (width - table.playWidth * scale) / 2f
-        offsetY = (height - table.playHeight * scale) / 2f
+        offsetY = hudHeight + (height - hudHeight - table.playHeight * scale) / 2f
     }
 
     private fun worldToScreen(p: Vec2) = Vec2(p.x * scale + offsetX, p.y * scale + offsetY)
     private fun screenToWorld(p: Vec2) = Vec2((p.x - offsetX) / scale, (p.y - offsetY) / scale)
 
-    // --- Touch input: drag from behind the cue ball to aim, release to shoot ---
+    // --- Touch input: HUD buttons, or drag from behind the cue ball to aim ---
 
     override fun onTouchEvent(event: MotionEvent): Boolean {
-        if (isSimulating) return true // ignore input while balls are moving
+        if (event.action == MotionEvent.ACTION_DOWN) {
+            if (resetButtonRect.contains(event.x, event.y)) {
+                resetRack()
+                return true
+            }
+            if (colorButtonRect.contains(event.x, event.y)) {
+                cycleFeltColor()
+                return true
+            }
+        }
+
+        if (isSimulating) return true // ignore aim input while balls are moving
 
         val worldTouch = screenToWorld(Vec2(event.x, event.y))
         when (event.action) {
@@ -162,13 +222,19 @@ class GameView @JvmOverloads constructor(
         return toTouch // pointing from cue ball toward drag point = shot direction
     }
 
+    /** Current pull-back distance as a 0..1 fraction of max power, for the meter and the shot itself. */
+    private fun currentPowerFraction(): Float {
+        val dragDist = (dragCurrent - cueBall.position).length()
+        return (dragDist / maxDragForFullPower).coerceIn(0f, 1f)
+    }
+
     private fun shoot(releasePoint: Vec2) {
         val toRelease = releasePoint - cueBall.position
         val dragDist = toRelease.length()
         if (dragDist < 1f) return
 
-        // Power scales with drag distance, capped at MAX_SHOT_SPEED.
-        val power = min(dragDist * 2.5f, PhysicsConstants.MAX_SHOT_SPEED)
+        val powerFraction = (dragDist / maxDragForFullPower).coerceIn(0f, 1f)
+        val power = powerFraction * PhysicsConstants.MAX_SHOT_SPEED
         cueBall.velocity = toRelease.normalized() * power
         isSimulating = true
     }
@@ -177,10 +243,12 @@ class GameView @JvmOverloads constructor(
 
     override fun run() {
         var lastTime = System.nanoTime()
+        val targetFrameNanos = 1_000_000_000L / 60L
+
         while (running) {
-            val now = System.nanoTime()
-            val dt = min((now - lastTime) / 1_000_000_000f, 1f / 30f) // clamp dt to avoid spiral of death
-            lastTime = now
+            val frameStart = System.nanoTime()
+            val dt = min((frameStart - lastTime) / 1_000_000_000f, 1f / 30f) // clamp dt to avoid spiral of death
+            lastTime = frameStart
 
             if (isSimulating) {
                 val stillMoving = PhysicsSimulator.step(table, allBalls, dt)
@@ -194,9 +262,13 @@ class GameView @JvmOverloads constructor(
                 holder.unlockCanvasAndPost(canvas)
             }
 
-            // Simple frame pacing (~60fps target).
-            val frameMillis = (now - System.nanoTime()) / 1_000_000L + 16L
-            if (frameMillis > 0) Thread.sleep(frameMillis)
+            // Frame pacing: sleep just enough to hit ~60fps, measured AFTER
+            // the render finished so we account for however long it took.
+            val elapsedNanos = System.nanoTime() - frameStart
+            val sleepNanos = targetFrameNanos - elapsedNanos
+            if (sleepNanos > 0) {
+                Thread.sleep(sleepNanos / 1_000_000L, (sleepNanos % 1_000_000L).toInt())
+            }
         }
     }
 
@@ -205,10 +277,20 @@ class GameView @JvmOverloads constructor(
 
         drawTable(canvas)
         drawBalls(canvas)
+        drawHud(canvas)
 
         if (isAiming && !isSimulating) {
             drawAimPreview(canvas)
+            drawPowerMeter(canvas)
         }
+    }
+
+    private fun drawHud(canvas: Canvas) {
+        canvas.drawRoundRect(resetButtonRect, 12f, 12f, hudButtonPaint)
+        canvas.drawText("New rack", resetButtonRect.centerX(), resetButtonRect.centerY() + 10f, hudTextPaint)
+
+        canvas.drawRoundRect(colorButtonRect, 12f, 12f, hudButtonPaint)
+        canvas.drawText("Table color", colorButtonRect.centerX(), colorButtonRect.centerY() + 10f, hudTextPaint)
     }
 
     private fun drawTable(canvas: Canvas) {
@@ -253,5 +335,32 @@ class GameView @JvmOverloads constructor(
                 if (impact.pocketedInto != null) potPaint else bankLinePaint
             )
         }
+    }
+
+    /** Vertical power meter on the right edge of the screen while aiming. */
+    private fun drawPowerMeter(canvas: Canvas) {
+        val fraction = currentPowerFraction()
+
+        val barWidth = 50f
+        val barHeight = 400f
+        val barRight = width - 40f
+        val barLeft = barRight - barWidth
+        val barTop = (height - barHeight) / 2f
+        val barBottom = barTop + barHeight
+
+        canvas.drawRoundRect(barLeft, barTop, barRight, barBottom, 10f, 10f, powerMeterBgPaint)
+
+        val fillHeight = barHeight * fraction
+        val fillTop = barBottom - fillHeight
+        // Green at low power, amber in the middle, red at full power.
+        powerMeterFillPaint.color = when {
+            fraction < 0.5f -> Color.rgb(90, 200, 90)
+            fraction < 0.8f -> Color.rgb(230, 190, 40)
+            else -> Color.rgb(220, 60, 50)
+        }
+        canvas.drawRoundRect(barLeft, fillTop, barRight, barBottom, 10f, 10f, powerMeterFillPaint)
+
+        val percentText = "${(fraction * 100).toInt()}%"
+        canvas.drawText(percentText, barLeft + barWidth / 2f, barTop - 16f, powerMeterTextPaint)
     }
 }
