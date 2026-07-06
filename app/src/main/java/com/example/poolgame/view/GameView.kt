@@ -189,7 +189,7 @@ class GameView @JvmOverloads constructor(
 
             val canvas = holder.lockCanvas() ?: continue
             try {
-                draw(canvas)
+                renderFrame(canvas)
             } finally {
                 holder.unlockCanvasAndPost(canvas)
             }
@@ -200,7 +200,7 @@ class GameView @JvmOverloads constructor(
         }
     }
 
-    private fun draw(canvas: Canvas) {
+    private fun renderFrame(canvas: Canvas) {
         canvas.drawColor(Color.rgb(15, 15, 15)) // letterbox background
 
         drawTable(canvas)
