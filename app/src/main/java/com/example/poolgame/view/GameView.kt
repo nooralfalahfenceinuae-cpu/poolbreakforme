@@ -11,6 +11,7 @@ import android.view.MotionEvent
 import android.view.SurfaceHolder
 import android.view.SurfaceView
 import com.example.poolgame.engine.PhysicsSimulator
+import com.example.poolgame.engine.ScoringEngine
 import com.example.poolgame.engine.TrajectoryEngine
 import com.example.poolgame.model.Ball
 import com.example.poolgame.model.PhysicsConstants
@@ -19,17 +20,18 @@ import com.example.poolgame.model.Vec2
 import kotlin.math.min
 
 /**
- * A fully playable single-view pool prototype:
- *  - Renders table, balls, pockets
- *  - Touch-drag from the cue ball aims (shows live trajectory preview + power meter)
- *  - Releasing the drag shoots the cue ball; power scales with drag distance
- *  - Runs a real physics simulation (friction, cushions, collisions, pockets)
- *    every frame until all balls stop, then re-enables aiming
- *  - Top bar lets you reset the rack or cycle the table felt color
+ * A playable English Billiards prototype: striker's cue ball, opponent's
+ * white ball, and the red ball. Scores cannons, winning hazards (potting an
+ * object ball), and losing hazards (potting the cue ball after contact),
+ * per standard English Billiards rules.
  *
- * This is a starting point for a real game, not a finished product — turn
- * order, fouls, ball-type assignment (solids/stripes), and win conditions
- * are left for you to layer on top of this loop.
+ *  - Touch-drag from the cue ball aims (live trajectory preview + power meter)
+ *  - Release to shoot; power scales with drag distance
+ *  - Real physics simulation runs until all balls stop, then scores the shot
+ *  - Object balls respot when potted; cue ball respots in the "D" when potted
+ *
+ * Turn order, fouls beyond the basic no-contact case, and a full match/game
+ * UI are left for you to layer on top of this.
  */
 class GameView @JvmOverloads constructor(
     context: Context,
@@ -40,9 +42,22 @@ class GameView @JvmOverloads constructor(
     @Volatile private var running = false
 
     private val table = Table(playWidth = 2000f, playHeight = 1000f, ballRadius = 28f)
-    private val cueBall = Ball(id = 0, position = Vec2(500f, 500f), radius = 28f, isCue = true, colorArgb = Color.WHITE)
-    private val objectBalls: MutableList<Ball> = buildRack()
 
+    // --- English Billiards ball ids ---
+    private val cueId = 0
+    private val opponentWhiteId = 1
+    private val redId = 2
+
+    // Fixed reference spots (world coordinates), matching a real billiards table layout.
+    private val dSpot = Vec2(300f, 500f)          // cue ball starts/respots in the "D"
+    private val centerSpot = Vec2(1000f, 500f)     // opponent white respot
+    private val pyramidSpot = Vec2(1500f, 500f)    // red ball respot
+
+    private val cueBall = Ball(id = cueId, position = dSpot, radius = table.ballRadius, isCue = true, colorArgb = Color.WHITE)
+    private val opponentWhite = Ball(id = opponentWhiteId, position = centerSpot, radius = table.ballRadius, colorArgb = Color.rgb(235, 235, 210))
+    private val redBall = Ball(id = redId, position = pyramidSpot, radius = table.ballRadius, colorArgb = Color.rgb(200, 30, 30))
+
+    private val objectBalls: List<Ball> = listOf(opponentWhite, redBall)
     private val allBalls: List<Ball> get() = listOf(cueBall) + objectBalls
 
     // Aiming state
@@ -53,13 +68,19 @@ class GameView @JvmOverloads constructor(
     /** Drag distance (world units) that counts as 100% power. Tune to taste. */
     private val maxDragForFullPower = 420f
 
+    // Score tracking
+    private var totalScore = 0
+    private var lastShotSummary = ""
+    private val shotContactedIds = mutableSetOf<Int>()
+    private val shotPottedIds = mutableSetOf<Int>()
+
     // World <-> screen transform
     private var scale = 1f
     private var offsetX = 0f
     private var offsetY = 0f
 
     // --- Top HUD bar (New Rack / Table Color buttons) ---
-    private val hudHeight = 120f
+    private val hudHeight = 160f
     private val resetButtonRect = RectF(30f, 30f, 260f, 90f)
     private val colorButtonRect = RectF(290f, 30f, 560f, 90f)
     private val feltColorOptions = listOf(
@@ -94,6 +115,12 @@ class GameView @JvmOverloads constructor(
     private val hudTextPaint = Paint().apply {
         color = Color.WHITE; textSize = 30f; isAntiAlias = true; textAlign = Paint.Align.CENTER
     }
+    private val scoreTextPaint = Paint().apply {
+        color = Color.WHITE; textSize = 42f; isAntiAlias = true; textAlign = Paint.Align.LEFT
+    }
+    private val shotSummaryPaint = Paint().apply {
+        color = Color.argb(230, 230, 200, 60); textSize = 26f; isAntiAlias = true; textAlign = Paint.Align.LEFT
+    }
 
     private val powerMeterBgPaint = Paint().apply { color = Color.argb(140, 0, 0, 0) }
     private val powerMeterFillPaint = Paint().apply { isAntiAlias = true }
@@ -106,40 +133,16 @@ class GameView @JvmOverloads constructor(
         isFocusable = true
     }
 
-    private fun buildRack(): MutableList<Ball> {
-        // Simple triangle rack of 6 object balls (a small subset for a quick playable demo).
-        val startX = 1400f
-        val startY = 500f
-        val spacing = 60f
-        val positions = listOf(
-            Vec2(startX, startY),
-            Vec2(startX + spacing, startY - spacing / 2f),
-            Vec2(startX + spacing, startY + spacing / 2f),
-            Vec2(startX + spacing * 2, startY - spacing),
-            Vec2(startX + spacing * 2, startY),
-            Vec2(startX + spacing * 2, startY + spacing)
-        )
-        val colors = listOf(
-            Color.rgb(220, 60, 40), Color.rgb(40, 90, 220), Color.rgb(230, 200, 30),
-            Color.rgb(120, 40, 160), Color.rgb(230, 130, 30), Color.rgb(30, 140, 60)
-        )
-        return positions.mapIndexed { i, p ->
-            Ball(id = i + 1, position = p, radius = table.ballRadius, colorArgb = colors[i])
-        }.toMutableList()
-    }
-
-    /** Resets the cue ball and all object balls back to the starting rack layout. */
+    /** Resets all three balls back to their starting spots and clears the score. */
     private fun resetRack() {
-        cueBall.position = Vec2(500f, 500f)
-        cueBall.velocity = Vec2(0f, 0f)
-        cueBall.pocketed = false
+        cueBall.position = dSpot; cueBall.velocity = Vec2(0f, 0f); cueBall.pocketed = false
+        opponentWhite.position = centerSpot; opponentWhite.velocity = Vec2(0f, 0f); opponentWhite.pocketed = false
+        redBall.position = pyramidSpot; redBall.velocity = Vec2(0f, 0f); redBall.pocketed = false
 
-        val fresh = buildRack()
-        for (i in objectBalls.indices) {
-            objectBalls[i].position = fresh[i].position
-            objectBalls[i].velocity = Vec2(0f, 0f)
-            objectBalls[i].pocketed = false
-        }
+        totalScore = 0
+        lastShotSummary = ""
+        shotContactedIds.clear()
+        shotPottedIds.clear()
         isSimulating = false
         isAiming = false
     }
@@ -219,7 +222,7 @@ class GameView @JvmOverloads constructor(
     private fun currentAimDirection(): Vec2? {
         val toTouch = dragCurrent - cueBall.position
         if (toTouch.length() < 1e-3f) return null
-        return toTouch // pointing from cue ball toward drag point = shot direction
+        return toTouch
     }
 
     /** Current pull-back distance as a 0..1 fraction of max power, for the meter and the shot itself. */
@@ -233,10 +236,43 @@ class GameView @JvmOverloads constructor(
         val dragDist = toRelease.length()
         if (dragDist < 1f) return
 
+        // Start tracking this shot's contacts/pockets fresh.
+        shotContactedIds.clear()
+        shotPottedIds.clear()
+
         val powerFraction = (dragDist / maxDragForFullPower).coerceIn(0f, 1f)
         val power = powerFraction * PhysicsConstants.MAX_SHOT_SPEED
         cueBall.velocity = toRelease.normalized() * power
         isSimulating = true
+    }
+
+    /** Called once all balls have stopped moving after a shot: scores it and handles respots. */
+    private fun finishShot() {
+        val breakdown = ScoringEngine.score(
+            cueId = cueId,
+            redId = redId,
+            opponentWhiteId = opponentWhiteId,
+            contactedIds = shotContactedIds,
+            pottedIds = shotPottedIds
+        )
+        totalScore += breakdown.totalPoints
+
+        val parts = mutableListOf<String>()
+        if (breakdown.cannon) parts.add("Cannon +${ScoringEngine.CANNON_POINTS}")
+        if (breakdown.winningHazardPoints > 0) parts.add("Winning hazard +${breakdown.winningHazardPoints}")
+        if (breakdown.losingHazardPoints > 0) parts.add("Losing hazard +${breakdown.losingHazardPoints}")
+        lastShotSummary = if (parts.isEmpty()) "No score" else parts.joinToString("  •  ")
+
+        // Respot any potted balls per standard billiards placement.
+        if (shotPottedIds.contains(redId)) {
+            redBall.position = pyramidSpot; redBall.velocity = Vec2(0f, 0f); redBall.pocketed = false
+        }
+        if (shotPottedIds.contains(opponentWhiteId)) {
+            opponentWhite.position = centerSpot; opponentWhite.velocity = Vec2(0f, 0f); opponentWhite.pocketed = false
+        }
+        if (shotPottedIds.contains(cueId)) {
+            cueBall.position = dSpot; cueBall.velocity = Vec2(0f, 0f); cueBall.pocketed = false
+        }
     }
 
     // --- Game loop ---
@@ -251,8 +287,19 @@ class GameView @JvmOverloads constructor(
             lastTime = frameStart
 
             if (isSimulating) {
-                val stillMoving = PhysicsSimulator.step(table, allBalls, dt)
-                if (!stillMoving) isSimulating = false
+                val result = PhysicsSimulator.step(table, allBalls, dt)
+
+                // Track every ball the cue ball touches this shot (for cannon/losing-hazard scoring).
+                for ((idA, idB) in result.collisions) {
+                    if (idA == cueId) shotContactedIds.add(idB)
+                    if (idB == cueId) shotContactedIds.add(idA)
+                }
+                shotPottedIds.addAll(result.newlyPocketed)
+
+                if (!result.anyMoving) {
+                    isSimulating = false
+                    finishShot()
+                }
             }
 
             val canvas = holder.lockCanvas() ?: continue
@@ -291,6 +338,11 @@ class GameView @JvmOverloads constructor(
 
         canvas.drawRoundRect(colorButtonRect, 12f, 12f, hudButtonPaint)
         canvas.drawText("Table color", colorButtonRect.centerX(), colorButtonRect.centerY() + 10f, hudTextPaint)
+
+        canvas.drawText("Score: $totalScore", 600f, 70f, scoreTextPaint)
+        if (lastShotSummary.isNotEmpty()) {
+            canvas.drawText(lastShotSummary, 600f, 115f, shotSummaryPaint)
+        }
     }
 
     private fun drawTable(canvas: Canvas) {
@@ -352,7 +404,6 @@ class GameView @JvmOverloads constructor(
 
         val fillHeight = barHeight * fraction
         val fillTop = barBottom - fillHeight
-        // Green at low power, amber in the middle, red at full power.
         powerMeterFillPaint.color = when {
             fraction < 0.5f -> Color.rgb(90, 200, 90)
             fraction < 0.8f -> Color.rgb(230, 190, 40)

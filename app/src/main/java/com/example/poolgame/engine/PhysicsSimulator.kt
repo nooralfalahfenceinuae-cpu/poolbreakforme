@@ -6,6 +6,15 @@ import com.example.poolgame.model.Table
 import com.example.poolgame.model.Vec2
 import kotlin.math.max
 
+/** What happened during a single physics tick, needed to score the shot once it ends. */
+data class StepResult(
+    val anyMoving: Boolean,
+    /** Ball ID pairs that collided this tick (order not significant). */
+    val collisions: List<Pair<Int, Int>>,
+    /** Ball IDs that transitioned into a pocket this tick (i.e. newly potted, not already-potted balls). */
+    val newlyPocketed: List<Int>
+)
+
 /**
  * Steps the real physics simulation forward by [dt] seconds: friction,
  * cushion rebounds, ball-to-ball elastic collisions, and pocket capture.
@@ -14,8 +23,8 @@ import kotlin.math.max
  */
 object PhysicsSimulator {
 
-    /** Advances all balls by one physics tick. Returns true if any ball is still moving. */
-    fun step(table: Table, balls: List<Ball>, dt: Float): Boolean {
+    /** Advances all balls by one physics tick. Reports collisions/pockets for scoring. */
+    fun step(table: Table, balls: List<Ball>, dt: Float): StepResult {
         var anyMoving = false
 
         for (ball in balls) {
@@ -28,10 +37,10 @@ object PhysicsSimulator {
             }
         }
 
-        resolveBallCollisions(balls)
-        resolvePockets(table, balls)
+        val collisions = resolveBallCollisions(balls)
+        val newlyPocketed = resolvePockets(table, balls)
 
-        return anyMoving
+        return StepResult(anyMoving, collisions, newlyPocketed)
     }
 
     private fun applyFriction(ball: Ball, dt: Float) {
@@ -92,9 +101,11 @@ object PhysicsSimulator {
     /**
      * Resolves all overlapping ball pairs using an equal-mass elastic
      * collision: velocity components along the collision normal are
-     * exchanged, tangential components are untouched.
+     * exchanged, tangential components are untouched. Returns the id pairs
+     * that collided this tick, so the caller can track cannons.
      */
-    private fun resolveBallCollisions(balls: List<Ball>) {
+    private fun resolveBallCollisions(balls: List<Ball>): List<Pair<Int, Int>> {
+        val collided = mutableListOf<Pair<Int, Int>>()
         val active = balls.filter { !it.pocketed }
         for (i in active.indices) {
             for (j in i + 1 until active.size) {
@@ -122,11 +133,16 @@ object PhysicsSimulator {
 
                 a.velocity = aTangent + normal * bNormalSpeed
                 b.velocity = bTangent + normal * aNormalSpeed
+
+                collided.add(a.id to b.id)
             }
         }
+        return collided
     }
 
-    private fun resolvePockets(table: Table, balls: List<Ball>) {
+    /** Marks balls that entered a pocket this tick, returning the newly-potted ids. */
+    private fun resolvePockets(table: Table, balls: List<Ball>): List<Int> {
+        val newlyPocketed = mutableListOf<Int>()
         for (ball in balls) {
             if (ball.pocketed) continue
             for (pocket in table.pockets) {
@@ -134,9 +150,11 @@ object PhysicsSimulator {
                 if (dist <= pocket.radius) {
                     ball.pocketed = true
                     ball.velocity = Vec2(0f, 0f)
+                    newlyPocketed.add(ball.id)
                     break
                 }
             }
         }
+        return newlyPocketed
     }
 }
